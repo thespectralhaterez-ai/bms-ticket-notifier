@@ -1,5 +1,5 @@
 """
-BMS Ticket Checker — CI/Headless mode for GitHub Actions.
+BMS Ticket Checker — Playwright/CI mode for GitHub Actions.
 Runs once, checks all configured watches, emails on changes.
 State is persisted via a JSON artifact.
 
@@ -14,7 +14,9 @@ from html import escape
 from datetime import datetime
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
+
 import requests
+from playwright.sync_api import sync_playwright
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -214,7 +216,7 @@ def resolve_region(slug):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# BMS API
+# BMS API — PLAYWRIGHT
 # ──────────────────────────────────────────────────────────────────────
 
 API_URL = (
@@ -234,117 +236,281 @@ def fetch_bms(
     bms_url,
 ):
     """
-    Fetch BMS data using one persistent session.
+    Open the real BMS website in Chromium first, then request the
+    showtime API from inside that browser context.
 
-    First loads the BMS movie page to establish cookies/session state,
-    then uses the same session for the API request.
+    This replaces requests.get() for BMS.
     """
 
-    session = requests.Session()
+    print("  Opening BMS in Chromium...")
 
-    # Browser-like base headers.
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/140.0.0.0 Safari/537.36"
-        ),
-        "Accept": (
-            "text/html,application/xhtml+xml,"
-            "application/xml;q=0.9,image/avif,image/webp,"
-            "*/*;q=0.8"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-    })
+    with sync_playwright() as p:
 
-    try:
-        # --------------------------------------------------------------
-        # STEP 1: Load the actual BMS page.
-        # This gives the session any cookies BMS provides.
-        # --------------------------------------------------------------
+        browser = None
 
-        page_resp = session.get(
-            bms_url,
-            timeout=15,
-            allow_redirects=True,
-        )
-
-        print(f"  BMS page HTTP {page_resp.status_code}")
-
-        if page_resp.status_code != 200:
-            print(
-                f"  ⚠️ BMS page request was rejected: "
-                f"{page_resp.status_code}"
+        try:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                ],
             )
 
-        # --------------------------------------------------------------
-        # STEP 2: Request the showtime API using the same session.
-        # --------------------------------------------------------------
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) "
+                    "Chrome/140.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
+                viewport={
+                    "width": 1366,
+                    "height": 768,
+                },
+            )
 
-        headers = {
-            "Accept": (
-                "application/json, text/plain, */*"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": bms_url,
+            page = context.new_page()
 
-            "x-app-code": "WEB",
-            "x-region-code": region_code,
-            "x-region-slug": region_slug,
-            "x-geohash": geohash,
-            "x-latitude": lat,
-            "x-longitude": lon,
-            "x-location-selection": "manual",
-            "x-lsid": "",
+            # ----------------------------------------------------------
+            # Open actual BMS movie page
+            # ----------------------------------------------------------
 
-            "sec-ch-ua": (
-                '"Chromium";v="140", '
-                '"Not=A?Brand";v="24", '
-                '"Google Chrome";v="140"'
-            ),
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-        }
+            response = page.goto(
+                bms_url,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
 
-        params = {
-            "eventCode": event_code,
-            "dateCode": date_code or "",
-            "isDesktop": "true",
-            "regionCode": region_code,
-            "xLocationShared": "false",
-            "memberId": "",
-            "lsId": "",
-            "subCode": "",
-            "lat": lat,
-            "lon": lon,
-        }
+            if response:
+                print(
+                    f"  BMS browser HTTP {response.status}"
+                )
+            else:
+                print(
+                    "  BMS browser navigation returned "
+                    "no HTTP response."
+                )
 
-        resp = session.get(
-            API_URL,
-            headers=headers,
-            params=params,
-            timeout=15,
-        )
+            # Give normal page scripts/challenges a moment.
+            page.wait_for_timeout(5000)
 
-        print(f"  BMS API HTTP {resp.status_code}")
+            print(
+                f"  Browser URL: {page.url}"
+            )
 
-        if resp.status_code == 200:
+            print(
+                f"  Browser title: {page.title()}"
+            )
+
+            # ----------------------------------------------------------
+            # Check the visible page for Cloudflare
+            # ----------------------------------------------------------
+
             try:
-                return resp.json()
-            except ValueError:
-                print("  ❌ BMS returned invalid JSON.")
-                print(f"  Response: {resp.text[:500]}")
+                page_text = page.locator(
+                    "body"
+                ).inner_text(timeout=5000)
+            except Exception:
+                page_text = ""
+
+            page_text_lower = page_text.lower()
+
+            if (
+                "attention required" in page_text_lower
+                or (
+                    "cloudflare" in page_text_lower
+                    and "403" in page_text_lower
+                )
+            ):
+                print(
+                    "  ⚠️ Cloudflare block/challenge "
+                    "detected on BMS page."
+                )
+
+            # ----------------------------------------------------------
+            # API request from INSIDE Chromium.
+            #
+            # This uses the browser context's cookies/session.
+            # ----------------------------------------------------------
+
+            result = page.evaluate(
+                """
+                async ({
+                    apiUrl,
+                    params,
+                    regionCode,
+                    regionSlug,
+                    geohash,
+                    lat,
+                    lon
+                }) => {
+
+                    const url = new URL(apiUrl);
+
+                    Object.entries(params).forEach(
+                        ([key, value]) => {
+                            url.searchParams.set(
+                                key,
+                                value
+                            );
+                        }
+                    );
+
+                    try {
+
+                        const response = await fetch(
+                            url.toString(),
+                            {
+                                method: "GET",
+
+                                headers: {
+                                    "Accept":
+                                        "application/json, text/plain, */*",
+
+                                    "Accept-Language":
+                                        "en-US,en;q=0.9",
+
+                                    "x-app-code":
+                                        "WEB",
+
+                                    "x-region-code":
+                                        regionCode,
+
+                                    "x-region-slug":
+                                        regionSlug,
+
+                                    "x-geohash":
+                                        geohash,
+
+                                    "x-latitude":
+                                        lat,
+
+                                    "x-longitude":
+                                        lon,
+
+                                    "x-location-selection":
+                                        "manual",
+
+                                    "x-lsid":
+                                        ""
+                                },
+
+                                credentials: "include"
+                            }
+                        );
+
+                        return {
+                            ok: true,
+                            status: response.status,
+                            text: await response.text()
+                        };
+
+                    } catch (error) {
+
+                        return {
+                            ok: false,
+                            status: 0,
+                            text: String(error)
+                        };
+                    }
+                }
+                """,
+                {
+                    "apiUrl": API_URL,
+
+                    "params": {
+                        "eventCode": event_code,
+                        "dateCode": date_code or "",
+                        "isDesktop": "true",
+                        "regionCode": region_code,
+                        "xLocationShared": "false",
+                        "memberId": "",
+                        "lsId": "",
+                        "subCode": "",
+                        "lat": lat,
+                        "lon": lon,
+                    },
+
+                    "regionCode": region_code,
+                    "regionSlug": region_slug,
+                    "geohash": geohash,
+                    "lat": lat,
+                    "lon": lon,
+                },
+            )
+
+            # ----------------------------------------------------------
+            # Process API result
+            # ----------------------------------------------------------
+
+            if not result["ok"]:
+                print(
+                    "  ❌ Browser API request failed:"
+                )
+                print(
+                    f"     {result['text']}"
+                )
                 return None
 
-        # Print a small part of the response for debugging.
-        print(
-            f"  ⚠️ BMS API response: "
-            f"{resp.text[:500]}"
-        )
+            status = result["status"]
 
-    except requests.RequestException as e:
-        print(f"  ❌ Request failed: {e}")
+            print(
+                f"  BMS API browser HTTP {status}"
+            )
+
+            if status == 200:
+
+                try:
+                    data = json.loads(
+                        result["text"]
+                    )
+
+                    print(
+                        "  ✅ BMS API returned JSON."
+                    )
+
+                    return data
+
+                except json.JSONDecodeError:
+
+                    print(
+                        "  ❌ BMS returned invalid JSON."
+                    )
+
+                    print(
+                        result["text"][:500]
+                    )
+
+                    return None
+
+            print(
+                "  ⚠️ BMS API response:"
+            )
+
+            print(
+                result["text"][:1000]
+            )
+
+            if status == 403:
+                print(
+                    "  ⚠️ HTTP 403 — the browser session "
+                    "was still rejected by BMS/Cloudflare."
+                )
+
+        except Exception as e:
+
+            print(
+                f"  ❌ Playwright/BMS request failed: {e}"
+            )
+
+            return None
+
+        finally:
+
+            if browser:
+                browser.close()
 
     return None
 
@@ -362,6 +528,7 @@ def parse_movie_info(data):
     for w in data.get("data", {}).get(
         "topStickyWidgets", []
     ):
+
         if w.get("type") == "horizontal-text-list":
 
             for item in w.get("data", []):
@@ -373,6 +540,7 @@ def parse_movie_info(data):
                     for c in row.get(
                         "components", []
                     ):
+
                         if "•" in c.get("text", ""):
                             info["language"] = (
                                 c["text"].strip()
@@ -381,18 +549,28 @@ def parse_movie_info(data):
     bs = data.get(
         "data", {}
     ).get(
-        "bottomSheetData", {}
+        "bottomSheetData",
+        {},
     )
 
     for w in bs.get(
-        "format-selector", {}
+        "format-selector",
+        {},
     ).get("widgets", []):
 
-        if w.get("type") == "vertical-text-list":
+        if w.get(
+            "type"
+        ) == "vertical-text-list":
 
-            for d in w.get("data", []):
+            for d in w.get(
+                "data",
+                [],
+            ):
 
-                if d.get("styleId") == "bottomsheet-subtitle":
+                if d.get(
+                    "styleId"
+                ) == "bottomsheet-subtitle":
+
                     info["name"] = d.get(
                         "text",
                         info["name"],
@@ -405,19 +583,30 @@ def parse_dates(data):
     dates = []
 
     for w in data.get(
-        "data", {}
+        "data",
+        {},
     ).get(
-        "topStickyWidgets", []
+        "topStickyWidgets",
+        [],
     ):
 
-        if w.get("type") != "horizontal-block-list":
+        if w.get(
+            "type"
+        ) != "horizontal-block-list":
             continue
 
-        for item in w.get("data", []):
+        for item in w.get(
+            "data",
+            [],
+        ):
 
-            texts = item.get("data", [])
+            texts = item.get(
+                "data",
+                [],
+            )
 
             if len(texts) >= 3:
+
                 style = item.get(
                     "styleId",
                     "",
@@ -443,22 +632,36 @@ def parse_shows(data):
     shows = []
 
     for w in data.get(
-        "data", {}
+        "data",
+        {},
     ).get(
-        "showtimeWidgets", []
+        "showtimeWidgets",
+        [],
     ):
 
-        if w.get("type") != "groupList":
+        if w.get(
+            "type"
+        ) != "groupList":
             continue
 
-        for g in w.get("data", []):
+        for g in w.get(
+            "data",
+            [],
+        ):
 
-            if g.get("type") != "venueGroup":
+            if g.get(
+                "type"
+            ) != "venueGroup":
                 continue
 
-            for card in g.get("data", []):
+            for card in g.get(
+                "data",
+                [],
+            ):
 
-                if card.get("type") != "venue-card":
+                if card.get(
+                    "type"
+                ) != "venue-card":
                     continue
 
                 addl = card.get(
@@ -497,12 +700,15 @@ def parse_shows(data):
                         )
                     ).strip()
 
-                    if not date_code and re.match(
-                        r"^\d{8}",
-                        sa.get(
-                            "cutOffDateTime",
-                            "",
-                        ),
+                    if (
+                        not date_code
+                        and re.match(
+                            r"^\d{8}",
+                            sa.get(
+                                "cutOffDateTime",
+                                "",
+                            ),
+                        )
                     ):
                         date_code = sa[
                             "cutOffDateTime"
@@ -548,11 +754,6 @@ def parse_shows(data):
                             )
                         )
 
-                        lbl, _ = AVAIL_STATUS_MAP.get(
-                            ca,
-                            ("UNKNOWN", ""),
-                        )
-
                         show.categories.append(
                             CatInfo(
                                 name=cat.get(
@@ -582,6 +783,7 @@ def filter_shows(
     time_periods,
     date_codes,
 ):
+
     result = []
 
     kws = (
@@ -618,7 +820,10 @@ def filter_shows(
 
         # Theatre filter
         if kws:
-            name_lower = s.venue_name.lower()
+
+            name_lower = (
+                s.venue_name.lower()
+            )
 
             if not any(
                 k in name_lower
@@ -627,17 +832,20 @@ def filter_shows(
                 continue
 
         # Date filter
-        if dates_set and s.date_code:
-
-            if s.date_code not in dates_set:
-                continue
+        if (
+            dates_set
+            and s.date_code
+            and s.date_code not in dates_set
+        ):
+            continue
 
         # Time period filter
         if periods:
 
             try:
                 tc = int(s.time_code)
-            except (ValueError, TypeError):
+
+            except ValueError:
                 tc = 0
 
             matched = False
@@ -665,19 +873,32 @@ def filter_shows(
 # ──────────────────────────────────────────────────────────────────────
 
 def load_state():
+
     try:
-        with open(STATE_FILE) as f:
+
+        with open(
+            STATE_FILE,
+            encoding="utf-8",
+        ) as f:
+
             return json.load(f)
 
     except (
         FileNotFoundError,
         json.JSONDecodeError,
     ):
+
         return {}
 
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
+
+    with open(
+        STATE_FILE,
+        "w",
+        encoding="utf-8",
+    ) as f:
+
         json.dump(
             state,
             f,
@@ -685,7 +906,11 @@ def save_state(state):
         )
 
 
-def build_state(shows, dates):
+def build_state(
+    shows,
+    dates,
+):
+
     show_state = {}
 
     for s in shows:
@@ -723,6 +948,7 @@ def detect_changes(
     old_state,
     new_state,
 ):
+
     changes = []
 
     # New dates opening
@@ -747,6 +973,7 @@ def detect_changes(
                 "AVAILABLE",
             )
         ):
+
             changes.append(
                 f"📅 NEW DATE OPENED: {dc}"
             )
@@ -770,9 +997,12 @@ def detect_changes(
         s = new_shows[key]
 
         changes.append(
-            f"🆕 NEW: {s['venue']} "
-            f"{s['time']} [{s['date']}] "
-            f"— {s['cat']} ₹{s['price']}"
+            f"🆕 NEW: "
+            f"{s['venue']} "
+            f"{s['time']} "
+            f"[{s['date']}] "
+            f"— {s['cat']} "
+            f"₹{s['price']}"
         )
 
     # Sold out → available
@@ -803,10 +1033,11 @@ def detect_changes(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# EMAIL NOTIFICATION
+# EMAIL — RESEND
 # ──────────────────────────────────────────────────────────────────────
 
 def _cat_status_label(status):
+
     return AVAIL_STATUS_MAP.get(
         status,
         ("UNKNOWN", ""),
@@ -819,19 +1050,23 @@ def send_email(
     shows,
     movie_info,
 ):
+
     api_key = RESEND_API_KEY.strip()
     to = RESEND_TO_EMAIL.strip()
+
     frm = (
         RESEND_FROM_EMAIL.strip()
         or "onboarding@resend.dev"
     )
 
     if not api_key or not to:
+
         print(
             "  ⚠️ Skipping email — "
-            "RESEND_API_KEY or RESEND_TO_EMAIL "
-            "not set."
+            "RESEND_API_KEY or "
+            "RESEND_TO_EMAIL not set."
         )
+
         return
 
     now_str = datetime.now().strftime(
@@ -849,17 +1084,14 @@ def send_email(
     if changes:
 
         rows = "".join(
-            f'<li style="padding:3px 0;'
-            f'font-size:14px;">'
+            f'<li style="padding:3px 0;font-size:14px;">'
             f'{escape(c)}</li>'
             for c in changes
         )
 
         changes_html = f"""
-        <h3 style="margin:0 0 8px 0;
-                   font-size:15px;
-                   font-weight:bold;
-                   color:#333;">
+        <h3 style="margin:0 0 8px 0;font-size:15px;
+                   font-weight:bold;color:#333;">
             Changes Detected
         </h3>
 
@@ -871,10 +1103,11 @@ def send_email(
         </ul>
         """
 
-    # Group shows by venue
+    # Shows grouped by venue
     venue_groups = {}
 
     for s in shows:
+
         venue_groups.setdefault(
             s.venue_name,
             [],
@@ -903,17 +1136,16 @@ def send_email(
 
             show_rows += (
                 f"<tr>"
-                f"<td style='padding:5px 8px;"
-                f"border-bottom:1px solid #ddd;"
-                f"font-size:13px;"
-                f"vertical-align:top;'>"
+                f'<td style="padding:5px 8px;'
+                f'border-bottom:1px solid #ddd;'
+                f'font-size:13px;'
+                f'vertical-align:top;">'
                 f"{escape(s.time)}{fmt}"
                 f"</td>"
-
-                f"<td style='padding:5px 8px;"
-                f"border-bottom:1px solid #ddd;"
-                f"font-size:13px;"
-                f"vertical-align:top;'>"
+                f'<td style="padding:5px 8px;'
+                f'border-bottom:1px solid #ddd;'
+                f'font-size:13px;'
+                f'vertical-align:top;">'
                 f"{cats}"
                 f"</td>"
                 f"</tr>"
@@ -955,53 +1187,67 @@ def send_email(
         """
 
     html = f"""<!doctype html>
+
 <html>
 
 <head>
 <meta charset="utf-8">
 </head>
 
-<body style="margin:0;
-             padding:24px;
-             font-family:Arial,Helvetica,sans-serif;
-             font-size:14px;
-             color:#333;
-             background:#fff;">
+<body style="
+    margin:0;
+    padding:24px;
+    font-family:Arial,Helvetica,sans-serif;
+    font-size:14px;
+    color:#333;
+    background:#fff;
+">
 
-    <h2 style="margin:0 0 4px 0;
-               font-size:18px;
-               color:#111;">
+    <h2 style="
+        margin:0 0 4px 0;
+        font-size:18px;
+        color:#111;
+    ">
         BMS Alert: {escape(movie_name)}
     </h2>
 
-    <p style="margin:0 0 20px 0;
-              font-size:13px;
-              color:#666;">
+    <p style="
+        margin:0 0 20px 0;
+        font-size:13px;
+        color:#666;
+    ">
         {escape(now_str)}
     </p>
 
-    <hr style="border:none;
-               border-top:1px solid #ddd;
-               margin:0 0 20px 0;">
+    <hr style="
+        border:none;
+        border-top:1px solid #ddd;
+        margin:0 0 20px 0;
+    ">
 
     {changes_html}
 
-    <h3 style="margin:0 0 8px 0;
-               font-size:15px;
-               font-weight:bold;
-               color:#333;">
+    <h3 style="
+        margin:0 0 8px 0;
+        font-size:15px;
+        font-weight:bold;
+        color:#333;
+    ">
         Current Showtimes
     </h3>
 
     {shows_html}
 
-    <p style="margin:24px 0 0 0;
-              font-size:12px;
-              color:#999;">
+    <p style="
+        margin:24px 0 0 0;
+        font-size:12px;
+        color:#999;
+    ">
         This is an automated alert from BMS Ticket Notifier.
     </p>
 
 </body>
+
 </html>
 """
 
@@ -1061,21 +1307,23 @@ def send_email(
         "from BMS Ticket Notifier.",
     ])
 
-    plain = "\n".join(plain_lines)
+    plain = "\n".join(
+        plain_lines
+    )
 
-    # Send through Resend
     try:
 
         resp = requests.post(
             "https://api.resend.com/emails",
+
             headers={
-                "Authorization": (
-                    f"Bearer {api_key}"
-                ),
-                "Content-Type": (
-                    "application/json"
-                ),
+                "Authorization":
+                    f"Bearer {api_key}",
+
+                "Content-Type":
+                    "application/json",
             },
+
             json={
                 "from": frm,
                 "to": [to],
@@ -1083,10 +1331,14 @@ def send_email(
                 "text": plain,
                 "html": html,
             },
+
             timeout=15,
         )
 
-        if resp.status_code in (200, 201):
+        if resp.status_code in (
+            200,
+            201,
+        ):
 
             print(
                 f"  ✅ Email sent to {to}"
@@ -1123,7 +1375,7 @@ def main():
 
     print(
         f"[{now_str}] "
-        f"BMS Ticket Checker — CI mode"
+        "BMS Ticket Checker — Playwright CI mode"
     )
 
     # Parse config
@@ -1131,14 +1383,23 @@ def main():
         CONFIG["url"]
     )
 
-    event_code = parsed["event_code"]
-    region_slug = parsed["region_slug"]
+    event_code = parsed[
+        "event_code"
+    ]
+
+    region_slug = parsed[
+        "region_slug"
+    ]
+
     url_date = parsed.get(
         "date_code",
         "",
     )
 
-    if not event_code or not region_slug:
+    if (
+        not event_code
+        or not region_slug
+    ):
 
         print(
             "  ❌ Invalid BMS_URL. "
@@ -1147,12 +1408,20 @@ def main():
 
         sys.exit(1)
 
-    region_code, region_slug_r, lat, lon, geohash = (
-        resolve_region(region_slug)
+    (
+        region_code,
+        region_slug_r,
+        lat,
+        lon,
+        geohash,
+    ) = resolve_region(
+        region_slug
     )
 
     # Determine dates
-    raw_dates = CONFIG["dates"].strip()
+    raw_dates = CONFIG[
+        "dates"
+    ].strip()
 
     if raw_dates:
 
@@ -1164,11 +1433,15 @@ def main():
 
     elif url_date:
 
-        date_list = [url_date]
+        date_list = [
+            url_date
+        ]
 
     else:
 
-        date_list = [""]
+        date_list = [
+            ""
+        ]
 
     print(
         f"  Event: {event_code}  "
@@ -1207,7 +1480,10 @@ def main():
 
             continue
 
-        if movie_info["name"] == "Unknown":
+        if (
+            movie_info["name"]
+            == "Unknown"
+        ):
 
             movie_info = parse_movie_info(
                 data
@@ -1221,7 +1497,7 @@ def main():
             parse_shows(data)
         )
 
-    # No showtimes
+    # No data
     if not all_shows:
 
         print(
@@ -1245,7 +1521,7 @@ def main():
 
     print(
         f"  📊 {len(filtered)} "
-        f"showtime(s) after filters"
+        "showtime(s) after filters"
     )
 
     # Build state
@@ -1256,6 +1532,7 @@ def main():
 
     old_state = load_state()
 
+    # Detect changes
     changes = []
 
     if old_state:
@@ -1265,14 +1542,17 @@ def main():
             new_state,
         )
 
-    save_state(new_state)
+    # Save state
+    save_state(
+        new_state
+    )
 
-    # Email only when changes occur
+    # Email
     if changes:
 
         print(
             f"\n  ⚡ {len(changes)} "
-            f"change(s) detected:"
+            "change(s) detected:"
         )
 
         for c in changes:
@@ -1284,8 +1564,8 @@ def main():
         send_email(
             (
                 f"BMS Alert: "
-                f"{movie_info['name']} - "
-                f"{len(changes)} change(s)"
+                f"{movie_info['name']} "
+                f"- {len(changes)} change(s)"
             ),
             changes,
             filtered,
@@ -1295,10 +1575,11 @@ def main():
     else:
 
         print(
-            "  ✅ No changes since last check."
+            "  ✅ No changes "
+            "since last check."
         )
 
-    # Print current status
+    # Current status
     print(
         f"\n  Current status "
         f"({len(filtered)} shows):"
